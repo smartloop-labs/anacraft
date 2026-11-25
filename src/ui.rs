@@ -533,6 +533,11 @@ struct Dash {
     joined: [u32; 8],
     /// The next place at the back of the board.
     next_join: u32,
+    /// When each panel was last asked for by its key, by `Tile::index`; zero
+    /// for one nobody has pressed. A terminal too short for the whole board
+    /// keeps the panels asked for most recently, so a key that switches a
+    /// panel on always puts it on screen.
+    asked: [u32; 8],
     /// The pane the arrow keys have picked out, if they have picked one. It
     /// is what Shift+arrow moves and what `z` zooms; nothing is picked until
     /// an arrow is pressed, so a board nobody is arranging wears no highlight.
@@ -576,6 +581,7 @@ impl Dash {
         self.panels = Panels::all();
         self.joined = OPENING_ORDER;
         self.next_join = OPENING_ORDER.len() as u32;
+        self.asked = [0; 8];
         self.focus = None;
         self.zoomed = false;
     }
@@ -591,6 +597,7 @@ impl Dash {
         *switch = !*switch;
         if *switch {
             self.joined[tile.index()] = self.next_join;
+            self.asked[tile.index()] = self.next_join;
             self.next_join += 1;
         } else if self.focus == Some(tile) {
             // The highlight goes with the pane rather than jumping to
@@ -676,6 +683,7 @@ impl Dash {
             // Nothing has been pressed yet, so the board opens in key order.
             joined: OPENING_ORDER,
             next_join: OPENING_ORDER.len() as u32,
+            asked: [0; 8],
             focus: None,
             zoomed: false,
             resetting: false,
@@ -2621,9 +2629,12 @@ fn draw(frame: &mut Frame, dash: &Dash) {
 /// the dashboard into vitals beside a full-height chunk list.
 fn body(frame: &mut Frame, dash: &Dash, area: Rect, narrow: bool, wide: bool) {
     if !dash.panels.any() {
+        // Nothing is on the board, so there is nothing for the arrows to walk
+        // or the footer to mark as showing.
+        dash.placed.borrow_mut().clear();
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  every panel is hidden — 1, 2 or 3 brings one back, ? lists the keys",
+                "  every panel is hidden — 1 to 8 brings one back, 0 all of them",
                 Style::default().fg(ore::stone()),
             )))
             .block(framed("ANACRAFT", "", ore::stone())),
@@ -2772,6 +2783,32 @@ enum Tile {
 }
 
 impl Tile {
+    /// Every tile, in key order.
+    const ALL: [Tile; 8] = [
+        Tile::Events,
+        Tile::Live,
+        Tile::Map,
+        Tile::Chunks,
+        Tile::Vitals,
+        Tile::RealmsRanked,
+        Tile::Trend,
+        Tile::Portals,
+    ];
+
+    /// The tile's name in the footer's list of panels, beside its number.
+    fn label(self) -> &'static str {
+        match self {
+            Tile::Events => "events",
+            Tile::Live => "now",
+            Tile::Map => "map",
+            Tile::Chunks => "pages",
+            Tile::Vitals => theme::say("vitals", "overview"),
+            Tile::RealmsRanked => "countries",
+            Tile::Trend => "daily",
+            Tile::Portals => theme::say("portals", "sources"),
+        }
+    }
+
     fn on(&self, panels: &Panels) -> bool {
         match self {
             Tile::Events => panels.events,
@@ -2907,17 +2944,7 @@ fn grid(dash: &Dash, area: Rect, wide: bool) -> Vec<(Tile, Rect)> {
     // board takes another row and everything already on it gives up the
     // height to pay for it. Only a body with no room left for
     // the tile's own borders drops one, from the bottom row up.
-    let order = [
-        Tile::Events,
-        Tile::Live,
-        Tile::Map,
-        Tile::Chunks,
-        Tile::Vitals,
-        Tile::RealmsRanked,
-        Tile::Trend,
-        Tile::Portals,
-    ];
-    let mut on: Vec<Tile> = order
+    let mut on: Vec<Tile> = Tile::ALL
         .iter()
         .copied()
         .filter(|tile| tile.on(&dash.panels))
@@ -2941,37 +2968,48 @@ fn grid(dash: &Dash, area: Rect, wide: bool) -> Vec<(Tile, Rect)> {
     let per = on.len() / rows_deep;
     let wider = on.len() % rows_deep;
 
-    let mut rows: Vec<Vec<Tile>> = Vec::with_capacity(rows_deep);
-    let mut queue = on.as_slice();
-    for depth in 0..rows_deep {
-        let (row, rest) = queue.split_at(per + usize::from(depth < wider));
-        rows.push(row.to_vec());
-        queue = rest;
-    }
-
-    // Each row's height is its tallest tile at minimum. Dropped tiles come
-    // off the bottom row until the whole grid fits the screen.
-    let mut row_min: Vec<u16> = rows
-        .iter()
-        .map(|row| row.iter().map(Tile::min_rows).max().unwrap_or(0))
+    // The cells, a row at a time. A body too short for all of them gives
+    // cells up from the bottom row, one at a time, until what is left fits.
+    //
+    // Which panels keep a cell is a separate question from where they sit.
+    // The ones asked for by key stay, the most recent press first; after
+    // those, the board from the front. So an untouched board loses its back
+    // rows, and a panel just switched on takes a cell from the one that has
+    // gone longest without being asked for, instead of joining a row that is
+    // not drawn. The survivors keep the order they joined in.
+    let sizes: Vec<usize> = (0..rows_deep)
+        .map(|depth| per + usize::from(depth < wider))
         .collect();
-    loop {
-        let gutter = rows.len().saturating_sub(1) as u16;
-        if gutter + row_min.iter().sum::<u16>() <= area.height {
-            break;
-        }
-        let last = rows.len() - 1;
-        rows[last].pop();
-        if rows[last].is_empty() {
-            rows.pop();
-            row_min.pop();
-        } else {
-            row_min[last] = rows[last].iter().map(Tile::min_rows).max().unwrap_or(0);
-        }
-        if rows.is_empty() {
+    let mut ranked = on.clone();
+    ranked.sort_by_key(|tile| {
+        (
+            std::cmp::Reverse(dash.asked[tile.index()]),
+            dash.joined[tile.index()],
+        )
+    });
+    let mut keep = on.len();
+    let (rows, row_min) = loop {
+        if keep == 0 {
             return Vec::new();
         }
-    }
+        let kept = &ranked[..keep];
+        let mut shown = on.iter().copied().filter(|tile| kept.contains(tile));
+        let rows: Vec<Vec<Tile>> = sizes
+            .iter()
+            .map(|size| shown.by_ref().take(*size).collect::<Vec<Tile>>())
+            .filter(|row| !row.is_empty())
+            .collect();
+        // Each row's height is its tallest tile at minimum.
+        let row_min: Vec<u16> = rows
+            .iter()
+            .map(|row| row.iter().map(Tile::min_rows).max().unwrap_or(0))
+            .collect();
+        let gutter = rows.len().saturating_sub(1) as u16;
+        if gutter + row_min.iter().sum::<u16>() <= area.height {
+            break (rows, row_min);
+        }
+        keep -= 1;
+    };
 
     // Leftover rows go to the first panel in priority order that can spend
     // them: the figures turn rows into bars and gaps, the map has a ceiling,
@@ -5153,6 +5191,44 @@ fn portals_panel(dash: &Dash, width: u16, height: u16) -> Paragraph<'static> {
     ))
 }
 
+/// Every panel under its number, on the footer's top edge: lit where the
+/// panel is on screen, hollow and dim where it is switched off. One that is
+/// on but has no room on this terminal wears a smaller mark and a dim name,
+/// so a short terminal says which panels are waiting behind the board. A bar
+/// too narrow for the names carries the numbers alone.
+fn panel_keys(dash: &Dash, width: u16) -> Line<'static> {
+    let placed = dash.placed.borrow();
+    let room = width.saturating_sub(4) as usize;
+    let named: usize = Tile::ALL
+        .iter()
+        .map(|tile| tile.label().chars().count() + 5)
+        .sum();
+    let names = named <= room;
+    let mut spans = vec![Span::raw(" ")];
+    for tile in Tile::ALL {
+        let on = tile.on(&dash.panels);
+        let shown = on && placed.iter().any(|(there, _)| *there == tile);
+        let (mark, lamp) = match (on, shown) {
+            (true, true) => ("\u{25a0}", ore::gold()),
+            (true, false) => ("\u{25aa}", ore::gold()),
+            (false, _) => ("\u{25a1}", ore::netherite()),
+        };
+        spans.push(Span::styled(
+            format!("{mark}{}", tile.index() + 1),
+            Style::default().fg(lamp).add_modifier(Modifier::BOLD),
+        ));
+        if names {
+            spans.push(Span::styled(
+                format!(" {}  ", tile.label()),
+                Style::default().fg(if shown { theme::fg() } else { ore::stone() }),
+            ));
+        } else {
+            spans.push(Span::raw(" "));
+        }
+    }
+    Line::from(spans)
+}
+
 fn footer(dash: &Dash, width: u16) -> Paragraph<'static> {
     // Everything the bar can say, less its borders and one cell held back so
     // the last slot never ends flush against the closing one.
@@ -5168,6 +5244,7 @@ fn footer(dash: &Dash, width: u16) -> Paragraph<'static> {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .title(panel_keys(dash, width))
                 .border_style(Style::default().fg(ore::redstone()))
                 .style(Style::default().bg(theme::bg_lift())),
         );
@@ -5274,6 +5351,7 @@ fn footer(dash: &Dash, width: u16) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans)).block(
         Block::default()
             .borders(Borders::ALL)
+            .title(panel_keys(dash, width))
             .border_style(Style::default().fg(ore::netherite()))
             .style(Style::default().bg(theme::bg_lift())),
     )
@@ -6419,6 +6497,72 @@ mod tests {
         assert!(
             dash.joined[Tile::Events.index()] > dash.joined[Tile::Portals.index()],
             "the returning panel jumped back into its old slot"
+        );
+    }
+
+    #[test]
+    fn a_panel_switched_on_gets_a_cell_on_a_board_with_none_to_spare() {
+        // A body twenty rows tall holds one row of three. The board opens on
+        // five panels, so two are already waiting — and a sixth used to join
+        // them, which made its key look dead. The panel just asked for takes
+        // a cell; the one that gives it up is the last of those never asked for.
+        use ratatui::layout::Rect;
+        let body = Rect::new(0, 0, 118, 20);
+        let on_board = |dash: &Dash| -> Vec<Tile> {
+            grid(dash, body, true)
+                .iter()
+                .map(|(tile, _)| *tile)
+                .collect()
+        };
+
+        let mut dash = capture_dash();
+        assert_eq!(
+            on_board(&dash),
+            [Tile::Events, Tile::Live, Tile::Map],
+            "an untouched board did not keep its front row"
+        );
+
+        dash.toggle(Tile::RealmsRanked);
+        assert_eq!(
+            on_board(&dash),
+            [Tile::Events, Tile::Live, Tile::RealmsRanked],
+            "the panel that was switched on is not on the board"
+        );
+
+        dash.toggle(Tile::RealmsRanked);
+        assert_eq!(
+            on_board(&dash),
+            [Tile::Events, Tile::Live, Tile::Map],
+            "switching it off did not give the cell back"
+        );
+    }
+
+    #[test]
+    fn the_footer_lists_every_panel_under_its_number() {
+        // On screen, on but waiting for room, and off each read differently,
+        // so the bar says what every number would do before it is pressed.
+        use ratatui::layout::Rect;
+        let _vocab = Vocab::lock();
+        let mut dash = capture_dash();
+        *dash.placed.borrow_mut() = vec![(Tile::Events, Rect::new(0, 0, 40, 12))];
+
+        let bar = rendered(120, 3, footer(&dash, 120)).join("\n");
+        for needle in [
+            "\u{25a0}1 events",
+            "\u{25aa}3 map",
+            "\u{25aa}5 vitals",
+            "\u{25a1}6 countries",
+            "\u{25a1}8 portals",
+        ] {
+            assert!(bar.contains(needle), "{needle} is not in the footer: {bar}");
+        }
+
+        // Too narrow for the names, it still carries the numbers.
+        dash.toggle(Tile::Events);
+        let bar = rendered(60, 3, footer(&dash, 60)).join("\n");
+        assert!(
+            bar.contains("\u{25a1}1 \u{25aa}2") && bar.contains("\u{25a1}8"),
+            "the narrow footer lost its numbers: {bar}"
         );
     }
 
