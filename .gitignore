@@ -24,3 +24,8 @@ helm/app/values.secrets.*.yaml
 # Written at deploy time by .github/workflows/pages.yml
 docs/app/config.js
 docs/app/app.css
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example
